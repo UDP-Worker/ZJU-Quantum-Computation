@@ -1,89 +1,142 @@
 # utility.py
-# 工具模块：用于加载 任意两类 手写数字数据集，并生成弱分类器（决策树桩）
-
 import numpy as np
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
-
+from sklearn.decomposition import PCA
 
 class DecisionStump:
-    """
-    决策桩：基于单一特征的阈值判断
-    属性：
-      - feature_index: 特征索引
-      - threshold: 阈值
-      - polarity: 极性（1 表示特征值 < 阈值时输出 -1，否则 +1；-1 则相反）
-    """
+    """单像素阈值决策桩"""
     def __init__(self, feature_index: int, threshold: float, polarity: int = 1):
         self.feature_index = feature_index
         self.threshold = threshold
         self.polarity = polarity
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        对输入数据 X（形状 [n_samples, n_features]）进行预测，返回 -1 或 +1
-        """
-        feature_values = X[:, self.feature_index]
-        preds = np.ones(len(feature_values), dtype=int)
+        vals = X[:, self.feature_index]
+        preds = np.ones(len(vals), dtype=int)
         if self.polarity == 1:
-            preds[feature_values < self.threshold] = -1
+            preds[vals < self.threshold] = -1
         else:
-            preds[feature_values > self.threshold] = -1
+            preds[vals > self.threshold] = -1
         return preds
 
+class PixelDiffStump:
+    """像素差分阈值桩：比较 feature_i - feature_j"""
+    def __init__(self, i: int, j: int, threshold: float, polarity: int = 1):
+        self.i, self.j = i, j
+        self.threshold = threshold
+        self.polarity = polarity
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        vals = X[:, self.i] - X[:, self.j]
+        preds = np.ones(len(vals), dtype=int)
+        if self.polarity == 1:
+            preds[vals < self.threshold] = -1
+        else:
+            preds[vals > self.threshold] = -1
+        return preds
+
+class PCAStump:
+    """PCA 投影阈值桩"""
+    def __init__(self, component_index: int, threshold: float, pca: PCA, polarity: int = 1):
+        self.component_index = component_index
+        self.threshold = threshold
+        self.pca = pca
+        self.polarity = polarity
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proj = self.pca.transform(X)[:, self.component_index]
+        preds = np.ones(len(proj), dtype=int)
+        if self.polarity == 1:
+            preds[proj < self.threshold] = -1
+        else:
+            preds[proj > self.threshold] = -1
+        return preds
 
 def load_data(classes=(0, 1), test_size: float = 0.2, random_state: int = 42):
-    """
-    加载 sklearn 的 digits 数据集，筛选标签为 classes 中的两类样本，
-    将第一个类映射为 -1，第二个类映射为 +1，
-    并切分为训练集和测试集。
-
-    参数:
-      - classes: 二分类类别的元组，例如 (3, 8)
-      - test_size: 测试集比例
-      - random_state: 随机种子
-
-    返回:
-      X_train, X_test, y_train, y_test
-    """
     digits = load_digits()
-    X = digits.data
-    y = digits.target
-    class_a, class_b = classes
-    mask = (y == class_a) | (y == class_b)
-    X = X[mask]
-    y = y[mask]
-    # 标签映射：class_a -> -1, class_b -> +1
-    y = np.where(y == class_a, -1, 1)
+    X, y = digits.data, digits.target
+    a, b = classes
+    mask = (y == a) | (y == b)
+    X, y = X[mask], y[mask]
+    y = np.where(y == a, -1, 1)
     return train_test_split(X, y, test_size=test_size, random_state=random_state)
 
-
-def generate_weak_classifiers(X: np.ndarray, num_thresholds: int = 10):
+def evaluate_stumps(X: np.ndarray, y: np.ndarray, stumps: list) -> np.ndarray:
     """
-    根据训练数据 X，针对每个特征按 num_thresholds 个等距阈值生成一系列决策桩。
-
-    参数:
-      - X: 训练特征数组，形状 [n_samples, n_features]
-      - num_thresholds: 每个特征上生成的阈值数目
-
-    返回:
-      弱分类器列表，每个元素都是 DecisionStump 实例
+    计算每个桩在 (X, y) 上的准确率，返回 accuracies 数组
     """
-    stumps = []
+    accuracies = np.zeros(len(stumps))
+    for idx, stump in enumerate(stumps):
+        preds = stump.predict(X)
+        accuracies[idx] = np.mean(preds == y)
+    return accuracies
+
+def generate_weak_classifiers(
+        X: np.ndarray,
+        y: np.ndarray,
+        num_stumps: int = 200,
+        num_thresholds: int = 10,
+        num_diff_pairs: int = 100,
+        n_pca_components: int = 5,
+        random_state: int = 42
+) -> list:
+    """
+    生成多类型弱分类器，然后根据在 (X, y) 上的表现挑选前 num_stumps 个最优桩。
+    但会先剔除那些在训练集上恒定输出的桩（只有 +1 或只有 -1）。
+    """
+    rng = np.random.RandomState(random_state)
     n_features = X.shape[1]
-    for feature_idx in range(n_features):
-        values = X[:, feature_idx]
-        min_v, max_v = values.min(), values.max()
-        thresholds = np.linspace(min_v, max_v, num_thresholds)
-        for thresh in thresholds:
-            stumps.append(DecisionStump(feature_idx, thresh, polarity=1))
-            stumps.append(DecisionStump(feature_idx, thresh, polarity=-1))
-    return stumps
+    candidates = []
+
+    # 1. 单像素阈值桩
+    for i in range(n_features):
+        vals = X[:, i]
+        threshs = np.linspace(vals.min(), vals.max(), num_thresholds)
+        for t in threshs:
+            candidates.append(DecisionStump(i, t, polarity=1))
+            candidates.append(DecisionStump(i, t, polarity=-1))
+
+    # 2. 像素差分阈值桩
+    features = np.arange(n_features)
+    pairs = [tuple(rng.choice(features, 2, replace=False)) for _ in range(num_diff_pairs)]
+    for (i, j) in pairs:
+        diffs = X[:, i] - X[:, j]
+        threshs = np.linspace(diffs.min(), diffs.max(), num_thresholds)
+        for t in threshs:
+            candidates.append(PixelDiffStump(i, j, t, polarity=1))
+            candidates.append(PixelDiffStump(i, j, t, polarity=-1))
+
+    # 3. PCA 投影阈值桩
+    pca = PCA(n_components=n_pca_components, random_state=random_state).fit(X)
+    proj = pca.transform(X)
+    for comp in range(n_pca_components):
+        vals = proj[:, comp]
+        threshs = np.linspace(vals.min(), vals.max(), num_thresholds)
+        for t in threshs:
+            candidates.append(PCAStump(comp, t, pca, polarity=1))
+            candidates.append(PCAStump(comp, t, pca, polarity=-1))
+
+    # —— 先剔除在训练集上恒定输出的桩 ——
+    filtered = []
+    for stump in candidates:
+        preds = stump.predict(X)
+        # 只有当桩在训练集上既有 +1 也有 -1 输出时，才保留
+        if preds.min() < preds.max():
+            filtered.append(stump)
+
+    # 评估剩余桩的准确率
+    accuracies = np.array([np.mean(stump.predict(X) == y) for stump in filtered])
+    # 按准确率降序，取前 num_stumps 个
+    top_idxs = np.argsort(accuracies)[::-1][:num_stumps]
+    return [filtered[i] for i in top_idxs]
 
 
 if __name__ == "__main__":
-    # 简单测试
-    # 比如想二分类数字 3 和 8，则调用：
-    X_train, X_test, y_train, y_test = load_data(classes=(6, 9))
-    classifiers = generate_weak_classifiers(X_train, num_thresholds=10)
-    print(f"生成了 {len(classifiers)} 个弱分类器（决策桩）")
+    # 简单测试：二分类 0 vs 3
+    X_train, X_test, y_train, y_test = load_data(classes=(0, 3))
+    stumps = generate_weak_classifiers(X_train, y_train, num_stumps=100)
+    print(f"最终挑选了 {len(stumps)} 个弱分类器")
+    # 查看前几个桩的准确率
+    accs = evaluate_stumps(X_train, y_train, stumps)
+    print("前5个桩的准确率：", accs[:5])

@@ -39,28 +39,84 @@ def build_qubo_matrix(stumps, X, y, lambda_reg=0.01):
     return Q
 
 
-def qboost_train(stumps, X_train, y_train, lambda_reg=0.01, num_reads=100):
-    Q = build_qubo_matrix(stumps, X_train, y_train, lambda_reg)
-    sampler = oj.SQASampler()
-
-    # 修正后的 schedule：每行 [s, beta, sweeps]
-    schedule = [
-        [0.0, 0.1, 500],  # s=0 时 β=0.1，做 500 步
-        [1.0, 5.0, 500]   # s=1 时 β=5.0，做 500 步
-    ]
-
-    # 同时指定 trotter 切片数（可选，默认为 1）
-    response = sampler.sample_qubo(
-        Q,
-        num_reads=num_reads,
+def qboost_train(
+        stumps,
+        X_train,
+        y_train,
+        lambda_reg=0.001,
+        num_reads=500,
+        use_quantum=False,          # ← True = SQA, False = SA
         trotter=8,
-        schedule=schedule
-    )
+        random_state=42):
+    """
+    训练一个 QBoost 子模型, 返回被挑选出的弱分类器列表
+    ----------------------------------------------------
+    use_quantum=False : 经典模拟退火  (oj.SASampler)
+    use_quantum=True  : 模拟量子退火 (oj.SQASampler)
+    """
 
-    best = response.first.sample
+    # --- 1. 构造 QUBO ---
+    Q = build_qubo_matrix(stumps, X_train, y_train, lambda_reg)
+
+    # --- 2. 打印 Q 统计 ---
+    if isinstance(Q, dict):        # OpenJij 允许 dict 或 ndarray
+        M = max(max(i, j) for i, j in Q.keys()) + 1
+        Q_arr = np.zeros((M, M))
+        for (i, j), v in Q.items():
+            Q_arr[i, j] = v
+            if i != j:
+                Q_arr[j, i] = v
+    else:
+        Q_arr = Q
+
+    diag = np.diag(Q_arr)
+    off  = Q_arr[np.triu_indices_from(Q_arr, k=1)]
+    neg  = (diag < 0).sum()
+    print(f"    ▶ Q diag min = {diag.min():.3g} | negative count = {neg}")
+    print(f"    ▶ Q diag mean/std = {diag.mean():.3g} / {diag.std():.3g}")
+    print(f"    ▶ Q off  mean/std = {off.mean():.3g} / {off.std():.3g}")
+
+    # --- 3. 选择采样器 & schedule ---
+    rng = np.random.RandomState(random_state)
+
+    if use_quantum:                              # ===== SQA =====
+        sampler = oj.SQASampler()
+        # schedule 行格式: [ s , γ , sweeps ]
+        sqa_schedule = [
+            [0.0, 1.5, 4000],    # 强横场起步
+            [1.0, 0.0, 4000]     # 衰减到 γ=0
+        ]
+        response = sampler.sample_qubo(
+            Q,
+            num_reads=num_reads,
+            trotter=trotter,
+            schedule=sqa_schedule,
+            seed=int(rng.randint(2**31))
+        )
+
+    else:                                         # ===== SA =====
+        sampler = oj.SASampler()
+        # schedule 行格式: [ β , sweeps ]
+        sa_schedule = [
+            [0.1, 4000],         # 高温 (β 小) – 探索
+            [5.0, 4000]          # 低温 (β 大) – 收敛
+        ]
+        response = sampler.sample_qubo(
+            Q,
+            num_reads=num_reads,
+            schedule=sa_schedule,
+            seed=int(rng.randint(2**31))
+        )
+
+    # --- 4. 解析最优样本 ---
+    best = response.first.sample          # dict: {idx:0/1, ...}
     sel_idx = [j for j, bit in best.items() if bit == 1]
-    return [stumps[j] for j in sel_idx]
 
+    # 可选：若完全没挑中桩，可打印提示
+    if not sel_idx:
+        print("    ⚠️  No stumps selected (all zeros)")
+
+    return [stumps[j] for j in sel_idx]
 
 def predict_strong(stumps, X):
     """
