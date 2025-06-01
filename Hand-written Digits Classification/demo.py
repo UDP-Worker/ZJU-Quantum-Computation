@@ -9,7 +9,7 @@ from Ising import qboost_train, predict_strong
 
 def main():
     # 1. 加载数据（可自定义分类对）
-    classes = (3, 8)  # 二分类数字，例如 (3, 8)
+    classes = (4, 6)  # 二分类数字，例如 (3, 8)
     X_train, X_test, y_train, y_test = load_data(classes=classes, test_size=0.2)
 
     # 2. 生成弱分类器并筛选前 M 个
@@ -43,7 +43,7 @@ def main():
         ax.imshow(img, cmap='gray')
         ax.set_title(f"T:{int((true_label+1)/2)} P:{int((pred_label+1)/2)}")
         ax.axis('off')
-    fig.suptitle(f"QBoost 二分类 ({classes[0]} vs {classes[1]}): 准确率 {acc*100:.2f}%")
+    fig.suptitle(f"QBoost classification ({classes[0]} vs {classes[1]}): Accuracy: {acc*100:.2f}%")
     plt.tight_layout()
     plt.show()
 
